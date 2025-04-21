@@ -54,8 +54,10 @@ function create_container() {
   # Get the next available container ID
   CTID=$(pvesh get /cluster/nextid)
   
-  # Ask for storage location
+  # Set up storage location with local-lvm as default
+  local STORAGE_LOCATION="local-lvm"
   local storage_list=$(pvesm status -content rootdir | awk 'NR>1 {print $1}')
+  
   if [ -z "$storage_list" ]; then
     msg_error "No valid storage locations found."
     exit 1
@@ -63,8 +65,20 @@ function create_container() {
   
   $ECHO -e "${C_YELLOW}Available storage locations:${C_NC}"
   $ECHO "$storage_list"
+  $ECHO -e "${C_GREEN}Using default storage: $STORAGE_LOCATION${C_NC}"
+  read -p "Change storage location? (y/n) [default: n]: " change_storage
   
-  read -p "Enter storage location: " STORAGE_LOCATION
+  if [[ "$change_storage" =~ ^[Yy]$ ]]; then
+    read -p "Enter storage location: " custom_storage
+    if [ ! -z "$custom_storage" ]; then
+      # Check if the entered storage exists
+      if echo "$storage_list" | grep -q "$custom_storage"; then
+        STORAGE_LOCATION="$custom_storage"
+      else
+        msg_error "Invalid storage location. Using default: $STORAGE_LOCATION"
+      fi
+    fi
+  fi
   
   # Check storage type
   local STORAGE_TYPE=$(get_storage_type $STORAGE_LOCATION)
@@ -77,7 +91,7 @@ function create_container() {
   local ARCH="amd64"
   local MEMORY="2048"
   local SWAP="512"
-  local DISK_SIZE="8G"
+  local DISK_SIZE="8"  # Just the number for LVM storage
   local CPU="2"
   local HOSTNAME="litellm"
   local PASSWORD=""
@@ -87,7 +101,7 @@ function create_container() {
   if [[ "$use_default" =~ ^[Nn]$ ]]; then
     read -p "CPU cores (default: 2): " custom_cpu
     read -p "Memory in MB (default: 2048): " custom_memory
-    read -p "Disk size (default: 8G): " custom_disk
+    read -p "Disk size in GB (default: 8): " custom_disk
     read -p "Hostname (default: litellm): " custom_hostname
     
     # Update with custom settings if provided
@@ -135,16 +149,31 @@ function create_container() {
   TEMPLATE=$(ls /var/lib/vz/template/cache/debian-12-standard_12.*_amd64.tar.zst | sort -V | tail -n1)
   
   # Create the container with the specified settings
-  pct create $CTID $TEMPLATE \
-    -hostname $HOSTNAME \
-    -cores $CPU \
-    -memory $MEMORY \
-    -swap $SWAP \
-    -rootfs $STORAGE_LOCATION:$DISK_SIZE \
-    -net0 name=eth0,bridge=$BRIDGE,$NET_CONFIG \
-    -features nesting=1 \
-    -password "$PASSWORD" \
-    -unprivileged 1
+  # For LVM storage, add G suffix if using local-lvm
+  if [[ "$STORAGE_LOCATION" == "local-lvm" ]]; then
+    pct create $CTID $TEMPLATE \
+      -hostname $HOSTNAME \
+      -cores $CPU \
+      -memory $MEMORY \
+      -swap $SWAP \
+      -rootfs $STORAGE_LOCATION:${DISK_SIZE} \
+      -net0 name=eth0,bridge=$BRIDGE,$NET_CONFIG \
+      -features nesting=1 \
+      -password "$PASSWORD" \
+      -unprivileged 1
+  else
+    # For other storage types, add G suffix
+    pct create $CTID $TEMPLATE \
+      -hostname $HOSTNAME \
+      -cores $CPU \
+      -memory $MEMORY \
+      -swap $SWAP \
+      -rootfs $STORAGE_LOCATION:${DISK_SIZE}G \
+      -net0 name=eth0,bridge=$BRIDGE,$NET_CONFIG \
+      -features nesting=1 \
+      -password "$PASSWORD" \
+      -unprivileged 1
+  fi
   
   if [ $? -ne 0 ]; then
     msg_error "Failed to create container."
