@@ -1,70 +1,186 @@
 #!/usr/bin/env bash
-source <(curl -fsSL https://raw.githubusercontent.com/community-scripts/ProxmoxVE/main/misc/build.func)
 
-# Copyright (c) 2025
+# LiteLLM Proxmox VE Container Script
 # License: MIT
 # Source: https://docs.litellm.ai/
 
+# Define variables with defaults
 APP="LiteLLM"
-var_tags="${var_tags:-ai;llm;proxy}"
-var_cpu="${var_cpu:-2}"
-var_ram="${var_ram:-2048}"
-var_disk="${var_disk:-8}"
-var_os="${var_os:-debian}"
-var_version="${var_version:-12}"
-var_unprivileged="${var_unprivileged:-1}"
-var_install="${var_install:-litellm}"
+CTID=""
+ECHO="/bin/echo"
+C_RED='\033[0;31m'
+C_GREEN='\033[0;32m'
+C_YELLOW='\033[0;33m'
+C_BLUE='\033[0;34m'
+C_NC='\033[0m' # No Color
 
-header_info "$APP"
-variables
-color
-catch_errors
-
-function update_script() {
-  header_info
-  check_container_storage
-  check_container_resources
-  
-  if [[ ! -f /etc/systemd/system/litellm.service ]]; then
-    msg_error "No ${APP} Installation Found!"
-    exit
-  fi
-  
-  msg_info "Stopping ${APP}"
-  systemctl stop litellm
-  
-  msg_info "Updating Dependencies"
-  $STD apt-get update
-  $STD apt-get upgrade -y
-  msg_ok "Updated Dependencies"
-  
-  msg_info "Updating ${APP}"
-  $STD pip3 install --upgrade pip
-  $STD pip3 install 'litellm[proxy]' --upgrade
-  msg_ok "Updated ${APP}"
-  
-  msg_info "Starting ${APP}"
-  systemctl start litellm
-  msg_ok "Started ${APP}"
-  
-  msg_info "Cleaning Up"
-  $STD apt-get autoremove -y
-  $STD apt-get autoclean -y
-  msg_ok "Cleaned Up"
-  
-  msg_ok "Update Completed"
-  echo -e "\n"
-  exit
+# Function to display colored text
+function msg() {
+  local color="$1"
+  local text="$2"
+  $ECHO -e "${color}${text}${C_NC}"
 }
 
-start
-build_container
+function msg_info() {
+  local text="$1"
+  msg "${C_BLUE}[INFO]${C_NC} ${text}"
+}
 
-cat <<EOF > /var/lib/vz/snippets/litellm.sh
-#!/usr/bin/env bash
+function msg_ok() {
+  local text="$1"
+  msg "${C_GREEN}[OK]${C_NC} ${text}"
+}
+
+function msg_error() {
+  local text="$1"
+  msg "${C_RED}[ERROR]${C_NC} ${text}"
+}
+
+function check_dependencies() {
+  which pveversion >/dev/null 2>&1 || { msg_error "This script requires Proxmox VE to run. Exiting..."; exit 1; }
+  which pvesm >/dev/null 2>&1 || { msg_error "Unable to detect Proxmox storage manager. Exiting..."; exit 1; }
+  which pct >/dev/null 2>&1 || { msg_error "Unable to detect Proxmox container tools. Exiting..."; exit 1; }
+}
+
+function get_storage_type() {
+  local storage_name="$1"
+  local storage_type=$(pvesm status -storage "$storage_name" 2>/dev/null | awk 'NR>1 {print $2}')
+  echo "$storage_type"
+}
+
+function create_container() {
+  msg_info "Creating LXC Container..."
+  
+  # Get the next available container ID
+  CTID=$(pvesh get /cluster/nextid)
+  
+  # Ask for storage location
+  local storage_list=$(pvesm status -content rootdir | awk 'NR>1 {print $1}')
+  if [ -z "$storage_list" ]; then
+    msg_error "No valid storage locations found."
+    exit 1
+  fi
+  
+  $ECHO -e "${C_YELLOW}Available storage locations:${C_NC}"
+  $ECHO "$storage_list"
+  
+  read -p "Enter storage location: " STORAGE_LOCATION
+  
+  # Check storage type
+  local STORAGE_TYPE=$(get_storage_type $STORAGE_LOCATION)
+  if [ -z "$STORAGE_TYPE" ]; then
+    msg_error "Invalid storage selected."
+    exit 1
+  fi
+  
+  # Default settings
+  local ARCH="amd64"
+  local MEMORY="2048"
+  local SWAP="512"
+  local DISK_SIZE="8G"
+  local CPU="2"
+  local HOSTNAME="litellm"
+  local PASSWORD=""
+  
+  # Ask if user wants custom settings
+  read -p "Use default container settings? (y/n): " use_default
+  if [[ "$use_default" =~ ^[Nn]$ ]]; then
+    read -p "CPU cores (default: 2): " custom_cpu
+    read -p "Memory in MB (default: 2048): " custom_memory
+    read -p "Disk size (default: 8G): " custom_disk
+    read -p "Hostname (default: litellm): " custom_hostname
+    
+    # Update with custom settings if provided
+    [[ ! -z "$custom_cpu" ]] && CPU="$custom_cpu"
+    [[ ! -z "$custom_memory" ]] && MEMORY="$custom_memory"
+    [[ ! -z "$custom_disk" ]] && DISK_SIZE="$custom_disk"
+    [[ ! -z "$custom_hostname" ]] && HOSTNAME="$custom_hostname"
+  fi
+  
+  # Generate a random password or ask for one
+  read -p "Set container root password (leave empty for random): " PASSWORD
+  if [[ -z "$PASSWORD" ]]; then
+    PASSWORD=$(tr -dc 'a-zA-Z0-9' < /dev/urandom | head -c 12)
+    $ECHO "Generated password: $PASSWORD"
+  fi
+  
+  # Choose network configuration
+  local BRIDGE="vmbr0"
+  read -p "Network bridge (default: vmbr0): " custom_bridge
+  [[ ! -z "$custom_bridge" ]] && BRIDGE="$custom_bridge"
+  
+  # Choose IP configuration (DHCP or static)
+  read -p "Use DHCP for IP configuration? (y/n): " use_dhcp
+  local NET_CONFIG=""
+  if [[ "$use_dhcp" =~ ^[Nn]$ ]]; then
+    read -p "IP address (CIDR format, e.g., 192.168.1.100/24): " IP_CIDR
+    read -p "Gateway IP: " GATEWAY
+    NET_CONFIG="ip=${IP_CIDR},gw=${GATEWAY}"
+  else
+    NET_CONFIG="ip=dhcp"
+  fi
+  
+  # Create the container
+  msg_info "Creating container with ID: $CTID"
+  
+  # Download the Debian template if not already present
+  local TEMPLATE_PATH="/var/lib/vz/template/cache/debian-12-standard_12.*_amd64.tar.zst"
+  if [ ! -f $TEMPLATE_PATH ]; then
+    msg_info "Downloading Debian 12 template..."
+    pveam update
+    pveam download local debian-12-standard_12.2-1_amd64.tar.zst
+  fi
+  
+  # Get the actual template file
+  TEMPLATE=$(ls /var/lib/vz/template/cache/debian-12-standard_12.*_amd64.tar.zst | sort -V | tail -n1)
+  
+  # Create the container with the specified settings
+  pct create $CTID $TEMPLATE \
+    -hostname $HOSTNAME \
+    -cores $CPU \
+    -memory $MEMORY \
+    -swap $SWAP \
+    -rootfs $STORAGE_LOCATION:$DISK_SIZE \
+    -net0 name=eth0,bridge=$BRIDGE,$NET_CONFIG \
+    -features nesting=1 \
+    -password "$PASSWORD" \
+    -unprivileged 1
+  
+  if [ $? -ne 0 ]; then
+    msg_error "Failed to create container."
+    exit 1
+  fi
+  
+  # Set a description for the container
+  pct set $CTID -description "LiteLLM Proxy Server - OpenAI compatible API"
+  
+  msg_ok "Container created successfully."
+  
+  # Start the container
+  msg_info "Starting the container..."
+  pct start $CTID
+  if [ $? -ne 0 ]; then
+    msg_error "Failed to start container."
+    exit 1
+  fi
+  sleep 5  # Give it some time to start up
+  
+  # Install LiteLLM
+  install_litellm
+}
+
+function install_litellm() {
+  msg_info "Installing LiteLLM in container $CTID..."
+  
+  # Create the installation script
+  cat > /tmp/litellm_install.sh << 'EOF'
+#!/bin/bash
+
+# Update system
+apt-get update
+apt-get upgrade -y
 
 # Install dependencies
-apt-get update
 apt-get install -y curl gnupg ca-certificates python3 python3-pip python3-venv git build-essential
 
 # Install LiteLLM
@@ -185,22 +301,44 @@ exit 0
 EOT
 
 chmod +x /usr/local/bin/litellm-manage
+
+# Return the IP for display
+hostname -I | awk '{print $1}'
 EOF
 
-description=$(cat << EOF
-LiteLLM Proxy LXC
-(${var_os} ${var_version})
-- Provides a standard OpenAI-compatible API interface
-- Supports multiple LLM providers
-- Features routing, fallbacks, caching & more
+  # Make the script executable and transfer to the container
+  chmod +x /tmp/litellm_install.sh
+  pct push $CTID /tmp/litellm_install.sh /tmp/litellm_install.sh
+  
+  # Execute the installation script in the container
+  msg_info "Running installation script inside container..."
+  local CONTAINER_IP=$(pct exec $CTID -- bash /tmp/litellm_install.sh)
+  
+  # Cleanup
+  rm -f /tmp/litellm_install.sh
+  pct exec $CTID -- rm -f /tmp/litellm_install.sh
+  
+  msg_ok "LiteLLM installation completed!"
+  
+  # Display access information
+  $ECHO -e "\n${C_GREEN}LiteLLM Proxy Server is now installed!${C_NC}"
+  $ECHO -e "${C_YELLOW}Access the API at:${C_NC} http://$CONTAINER_IP:4000"
+  $ECHO -e "${C_YELLOW}Default API Key:${C_NC} sk-litellm-changeme"
+  $ECHO -e "${C_YELLOW}Container ID:${C_NC} $CTID"
+  $ECHO -e "${C_YELLOW}Container Password:${C_NC} $PASSWORD"
+  $ECHO -e "\n${C_BLUE}You can log into the container using:${C_NC}"
+  $ECHO "pct enter $CTID"
+  $ECHO -e "\n${C_BLUE}For more details, log into the container and read the MOTD.${C_NC}"
+}
 
-Default API Key: sk-litellm-changeme
-EOF
-)
+# Main script execution
+clear
+$ECHO -e "${C_GREEN}╔════════════════════════════════════════╗${C_NC}"
+$ECHO -e "${C_GREEN}║      LiteLLM Proxmox VE Installer      ║${C_NC}"
+$ECHO -e "${C_GREEN}╚════════════════════════════════════════╝${C_NC}"
+$ECHO -e "This script will create a Proxmox container and install LiteLLM.\n"
 
-msg_ok "Completed Successfully!\n"
-echo -e "${CREATING}${GN}${APP} LXC setup has been completed!${CL}"
-echo -e "${INFO}${YW}The API is accessible at:${CL}"
-echo -e "${TAB}${GATEWAY}${BGN}http://${IP}:4000${CL}"
-echo -e "${INFO}${YW}Default API key:${CL}"
-echo -e "${TAB}${BGN}sk-litellm-changeme${CL}"
+check_dependencies
+create_container
+
+exit 0
