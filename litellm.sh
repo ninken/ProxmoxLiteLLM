@@ -111,12 +111,15 @@ function create_container() {
     [[ ! -z "$custom_hostname" ]] && HOSTNAME="$custom_hostname"
   fi
   
-  # Generate a random password or ask for one
-  read -p "Set container root password (leave empty for random): " PASSWORD
-  if [[ -z "$PASSWORD" ]]; then
-    PASSWORD=$(tr -dc 'a-zA-Z0-9' < /dev/urandom | head -c 12)
-    $ECHO "Generated password: $PASSWORD"
-  fi
+  # Generate a random password or ask for one (required)
+  while true; do
+    read -p "Set container root password: " PASSWORD
+    if [[ -z "$PASSWORD" ]]; then
+      echo -e "${C_YELLOW}Password is required.${C_NC}"
+    else
+      break
+    fi
+  done
   
   # Choose network configuration
   local BRIDGE="vmbr0"
@@ -210,14 +213,16 @@ apt-get update
 apt-get upgrade -y
 
 # Install dependencies
-apt-get install -y curl gnupg ca-certificates python3 python3-pip python3-venv git build-essential
+apt-get install -y curl gnupg ca-certificates python3 python3-pip python3-venv python3-full git build-essential
 
-# Install LiteLLM
-pip3 install --upgrade pip
-pip3 install 'litellm[proxy]'
-
-# Create configuration directory
+# Create virtual environment for LiteLLM
 mkdir -p /opt/litellm
+python3 -m venv /opt/litellm/venv
+
+# Activate virtual environment and install LiteLLM
+source /opt/litellm/venv/bin/activate
+pip install --upgrade pip
+pip install 'litellm[proxy]'
 
 # Create config file
 cat <<'EOT' > /opt/litellm/config.yaml
@@ -244,7 +249,7 @@ EOT
 
 chmod 600 /opt/litellm/.env
 
-# Create systemd service
+# Create systemd service with correct path to virtual environment
 cat <<'EOT' > /etc/systemd/system/litellm.service
 [Unit]
 Description=LiteLLM Proxy Server
@@ -254,7 +259,7 @@ After=network.target
 Type=simple
 User=root
 WorkingDirectory=/opt/litellm
-ExecStart=/usr/bin/python3 -m litellm --port 4000 --config /opt/litellm/config.yaml --num_workers 2
+ExecStart=/opt/litellm/venv/bin/python -m litellm --port 4000 --config /opt/litellm/config.yaml --num_workers 2
 Restart=always
 RestartSec=10
 
@@ -266,6 +271,14 @@ EOT
 systemctl daemon-reload
 systemctl enable litellm.service
 systemctl start litellm.service
+
+# Check service status
+SERVICE_STATUS=$(systemctl is-active litellm)
+if [ "$SERVICE_STATUS" != "active" ]; then
+  echo "LiteLLM service failed to start. Check logs with: journalctl -u litellm"
+  echo "Service status: $(systemctl status litellm | grep 'Active:')"
+  exit 1
+fi
 
 # Display MOTD for info
 IP=$(hostname -I | awk '{print $1}')
@@ -292,6 +305,12 @@ cat <<EOT > /etc/motd
   -H "Authorization: Bearer sk-litellm-changeme" \
   -d '{"model": "gpt-3.5-turbo", "messages": [{"role": "user", "content": "Hello"}]}'
 ─────────────────────────────────────────────────────────
+ Management commands:
+ litellm-manage status  - Check service status
+ litellm-manage restart - Restart the service
+ litellm-manage logs    - View service logs
+ litellm-manage update  - Update LiteLLM
+─────────────────────────────────────────────────────────
 EOT
 
 # Install a simple management script
@@ -317,8 +336,10 @@ case "$1" in
     journalctl -u litellm -f
     ;;
   update)
-    pip3 install 'litellm[proxy]' --upgrade
-    systemctl restart litellm
+    systemctl stop litellm
+    source /opt/litellm/venv/bin/activate
+    pip install 'litellm[proxy]' --upgrade
+    systemctl start litellm
     echo "LiteLLM updated and restarted."
     ;;
   *)
@@ -355,9 +376,15 @@ EOF
   $ECHO -e "${C_YELLOW}Default API Key:${C_NC} sk-litellm-changeme"
   $ECHO -e "${C_YELLOW}Container ID:${C_NC} $CTID"
   $ECHO -e "${C_YELLOW}Container Password:${C_NC} $PASSWORD"
-  $ECHO -e "\n${C_BLUE}You can log into the container using:${C_NC}"
-  $ECHO "pct enter $CTID"
-  $ECHO -e "\n${C_BLUE}For more details, log into the container and read the MOTD.${C_NC}"
+  $ECHO -e "\n${C_BLUE}Login instructions:${C_NC}"
+  $ECHO -e "1. Connect to the container: ${C_GREEN}pct enter $CTID${C_NC}"
+  $ECHO -e "2. Login with username ${C_GREEN}root${C_NC} and your password"
+  $ECHO -e "\n${C_BLUE}Management commands (inside container):${C_NC}"
+  $ECHO -e "- Check service status: ${C_GREEN}litellm-manage status${C_NC}"
+  $ECHO -e "- View service logs: ${C_GREEN}litellm-manage logs${C_NC}"
+  $ECHO -e "- Restart service: ${C_GREEN}litellm-manage restart${C_NC}"
+  $ECHO -e "- Edit config: ${C_GREEN}nano /opt/litellm/config.yaml${C_NC}"
+  $ECHO -e "\n${C_BLUE}For more details, log into the container and check the welcome message.${C_NC}"
 }
 
 # Main script execution
